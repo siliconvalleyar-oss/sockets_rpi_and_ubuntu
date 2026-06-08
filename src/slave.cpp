@@ -1,32 +1,47 @@
 #include <iostream>
 #include <fstream>
-#include <cstring>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>   // Para inet_ntoa
-#include <unistd.h>
 #include <string>
+#include <csignal>
+#include <cstring>
+#include <sys/wait.h>
 
-const int BUFFER_SIZE = 1024;
-const int ACK_SIZE = 1;
+#include "protocol.h"
+#include "socket_utils.h"
 
-bool receiveFile(int clientSock) {
-    char metadata[256];
-    int bytes = recv(clientSock, metadata, sizeof(metadata)-1, 0);
-    if (bytes <= 0) return false;
-    metadata[bytes] = '\0';
-    std::string metadataStr(metadata);
-    size_t newlinePos = metadataStr.find('\n');
-    if (newlinePos == std::string::npos) return false;
-    std::string filename = metadataStr.substr(0, newlinePos);
-    std::string rest = metadataStr.substr(newlinePos+1);
-    newlinePos = rest.find('\n');
-    if (newlinePos == std::string::npos) return false;
-    size_t fileSize = std::stoull(rest.substr(0, newlinePos));
+static bool g_running = true;
+static std::string g_outDir = ".";
 
-    std::ofstream outFile(filename, std::ios::binary);
+static void handleSigint(int) {
+    std::cerr << "\nCerrando servidor..." << std::endl;
+    g_running = false;
+}
+
+static void handleSigchld(int) {
+    while (waitpid(-1, nullptr, WNOHANG) > 0);
+}
+
+static bool receiveFile(int clientSock, const std::string& peerIP) {
+    char metaBuf[512];
+    int metaLen;
+    if (!recvSome(clientSock, metaBuf, sizeof(metaBuf) - 1, metaLen)) {
+        std::cerr << "Error: no se recibieron metadatos de " << peerIP << std::endl;
+        return false;
+    }
+    metaBuf[metaLen] = '\0';
+
+    std::string metaStr(metaBuf);
+    size_t nl1 = metaStr.find('\n');
+    if (nl1 == std::string::npos) return false;
+    std::string filename = metaStr.substr(0, nl1);
+
+    size_t nl2 = metaStr.find('\n', nl1 + 1);
+    if (nl2 == std::string::npos) return false;
+    size_t fileSize = std::stoull(metaStr.substr(nl1 + 1, nl2 - nl1 - 1));
+
+    std::string outPath = g_outDir + "/" + filename;
+    std::ofstream outFile(outPath, std::ios::binary);
     if (!outFile.is_open()) {
-        std::cerr << "Error creando " << filename << std::endl;
+        std::cerr << "Error creando " << outPath << std::endl;
         return false;
     }
 
@@ -34,56 +49,113 @@ bool receiveFile(int clientSock) {
     size_t totalReceived = 0;
     while (totalReceived < fileSize) {
         size_t toRead = std::min(fileSize - totalReceived, (size_t)BUFFER_SIZE);
-        int recvBytes = recv(clientSock, buffer, toRead, 0);
-        if (recvBytes <= 0) break;
+        int recvBytes;
+        if (!recvSome(clientSock, buffer, toRead, recvBytes)) {
+            std::cerr << "\nError: conexion perdida recibiendo datos" << std::endl;
+            return false;
+        }
         outFile.write(buffer, recvBytes);
         totalReceived += recvBytes;
-        char ack = 'K';
-        send(clientSock, &ack, ACK_SIZE, 0);
-        std::cout << "Recibido: " << (totalReceived * 100 / fileSize) << "%\r" << std::flush;
+
+        char ack = ACK_OK;
+        if (!sendAll(clientSock, &ack, ACK_SIZE)) {
+            std::cerr << "\nError: fallo al enviar ACK" << std::endl;
+            return false;
+        }
+
+        std::cout << "\r[" << peerIP << "] Recibido: "
+                  << (totalReceived * 100 / fileSize) << "%" << std::flush;
     }
-    std::cout << std::endl;
+
     char end;
-    recv(clientSock, &end, 1, 0);
+    recvAll(clientSock, &end, 1);
+
     outFile.close();
-    std::cout << "Archivo " << filename << " recibido (" << totalReceived << " bytes)" << std::endl;
+    std::cout << "\n[" << peerIP << "] Archivo " << filename
+              << " recibido (" << totalReceived << " bytes)" << std::endl;
     return true;
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        std::cerr << "Uso: " << argv[0] << " <puerto>" << std::endl;
-        return 1;
-    }
-    int port = std::stoi(argv[1]);
+static void handleClient(Socket client, struct sockaddr_in peer) {
+    char ipStr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &peer.sin_addr, ipStr, sizeof(ipStr));
+    std::string peerIP(ipStr);
 
-    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSock < 0) {
-        std::cerr << "Error al crear socket" << std::endl;
+    std::cout << "Conectado: " << peerIP << ":" << ntohs(peer.sin_port) << std::endl;
+    receiveFile(client.fd(), peerIP);
+}
+
+static void usage(const char* prog) {
+    std::cerr << "Uso: " << prog << " [opciones] <puerto>\n"
+              << "Opciones:\n"
+              << "  -o <dir>  directorio de salida (defecto: .)\n"
+              << "  -d        modo daemon (background)\n"
+              << "Ejemplo:\n"
+              << "  " << prog << " 5000\n"
+              << "  " << prog << " -o ~/recibidos 5000\n";
+}
+
+int main(int argc, char* argv[]) {
+    bool runDaemon = false;
+    int optIdx = 1;
+
+    while (optIdx < argc && argv[optIdx][0] == '-') {
+        std::string opt(argv[optIdx]);
+        if (opt == "-o" && optIdx + 1 < argc) {
+            g_outDir = argv[optIdx + 1];
+            optIdx += 2;
+        } else if (opt == "-d") {
+            runDaemon = true;
+            optIdx++;
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (optIdx >= argc) {
+        usage(argv[0]);
         return 1;
     }
-    struct sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(port);
-    if (bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        std::cerr << "Error en bind" << std::endl;
-        close(serverSock);
+    int port = std::stoi(argv[optIdx]);
+
+    signal(SIGINT, handleSigint);
+    signal(SIGCHLD, handleSigchld);
+
+    if (runDaemon && ::daemon(0, 0) < 0) {
+        std::cerr << "Error: no se pudo hacer daemon" << std::endl;
         return 1;
     }
-    listen(serverSock, 1);
-    std::cout << "Esperando conexión en puerto " << port << "..." << std::endl;
-    struct sockaddr_in clientAddr;
-    socklen_t clientLen = sizeof(clientAddr);
-    int clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &clientLen);
-    if (clientSock < 0) {
-        std::cerr << "Error en accept" << std::endl;
-        close(serverSock);
+
+    try {
+        Socket server = makeServerSocket(port);
+        std::cout << "Servidor escuchando en puerto " << port
+                  << " (directorio: " << g_outDir << ")" << std::endl;
+
+        while (g_running) {
+            try {
+                struct sockaddr_in peer;
+                Socket client = server.accept(&peer);
+                pid_t pid = fork();
+                if (pid < 0) {
+                    std::cerr << "Error: fork fallo" << std::endl;
+                    continue;
+                }
+                if (pid == 0) {
+                    server.close();
+                    signal(SIGINT, SIG_DFL);
+                    handleClient(std::move(client), peer);
+                    _exit(0);
+                }
+            } catch (const SocketError& e) {
+                if (g_running)
+                    std::cerr << "Error en accept: " << e.what() << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
-    std::cout << "Conectado: " << inet_ntoa(clientAddr.sin_addr) << std::endl;
-    bool ok = receiveFile(clientSock);
-    close(clientSock);
-    close(serverSock);
-    return ok ? 0 : 1;
+
+    return 0;
 }
